@@ -1,102 +1,120 @@
-module atom(<Type>) @private;
+module atom::subscriptions;
 
-import
-    std::thread @norecurse,
-    std::collections::list @norecurse,
-    std::collections::map @norecurse
-;
+import std::thread, std::collections::map, std::collections::list, atom::contracts;
 
-def Subscriber = fn void!(void* ctx, Type* old_value, Type* new_value);
-def Subscriptions = HashMap(<void*, void*>);
-
-struct AtomEntry { 
-    Subscriptions subscriptions;
-    Mutex mu;
+fn SubscriptionKey Observable.key(&self) {
+    return self.ptr.hash();
 }
 
-def AtomKey = void*;
-def AtomSubscriptions = HashMap(<AtomKey, AtomEntry*>);
-
-AtomSubscriptions global_subscriptions @noinit;
-
-fn void init() @init {
-    global_subscriptions.new_init();
+struct ObserverEntry (Subscription) {
+	SubscriptionKey subscription_key;
+	Observer observer;
 }
 
-fn void! Atom.notify_subscribers(&self, Type* old_value, Type* new_value) {
-    AtomKey atom_key = self.key();
+fn void! ObserverEntry.unsubscribe(&self) @dynamic {
+	if(!subscription_registry.has_key(self.subscription_key)) {
+		return;
+	}
 
-    if (!global_subscriptions.has_key(atom_key)) {
+	SubscriptionEntry* entry = subscription_registry[self.subscription_key]!;
+
+    if(entry.observers.is_empty()) {
         return;
     }
+    
+	entry.mu.lock()!;
 
-    AtomEntry* entry = global_subscriptions.get(atom_key)!;
+	for(int i = (int)entry.observers.len() - 1; i >= 0; --i) {		
+		if(entry.observers[i].observer.ptr == self.observer.ptr) {
+			entry.observers.remove_at(i);
+		}	
+	}
 
-    if(entry.subscriptions.is_empty()) {
+    entry.mu.unlock()!;
+
+	if(entry.observers.is_empty()) {
+		subscription_registry.remove(self.subscription_key);
+    	entry.mu.destroy()!;
+		mem::free(entry);
+		*entry = {};
+    }
+
+	mem::free(self);
+	*self = {};
+}
+
+def Observers = List(<ObserverEntry*>);
+
+def SubscriptionKey = uint;
+
+struct SubscriptionEntry  {
+	SubscriptionKey key;
+	Observers observers;
+	Mutex mu;
+}
+
+HashMap(<SubscriptionKey, SubscriptionEntry*>) subscription_registry;
+
+fn void init_atom_subscriptions() @init {
+    subscription_registry.new_init();
+}
+
+fn Subscription! new(Observable observable, Observer observer) {
+	SubscriptionKey subscription_key = observable.key();
+
+	SubscriptionEntry* entry;
+	
+	if(!subscription_registry.has_key(subscription_key)) {
+ 		entry = mem::new(SubscriptionEntry);
+        if(catch err = entry.mu.init()){
+            mem::free(entry);
+            return err?;
+        }
+        entry.observers.new_init();
+        subscription_registry[subscription_key] = entry;
+	} else {
+		entry = subscription_registry[subscription_key]!;
+	}
+
+	ObserverEntry* observer_entry = mem::new(ObserverEntry, {
+		.subscription_key = subscription_key,
+		.observer = observer,
+	});
+
+	entry.observers.push(observer_entry);
+
+	return observer_entry;
+}
+
+fn void! notify(Observable observable) {
+	SubscriptionKey subscription_key = observable.key();
+
+	if(!subscription_registry.has_key(subscription_key)) {
+		return;
+	}
+
+	SubscriptionEntry* entry = subscription_registry[subscription_key]!;
+
+	if(entry.observers.is_empty()) {
         return;
     }
 
     entry.mu.lock()!;
 
-    entry.subscriptions.@each(;Subscriber subscriber, void* ctx) {
-        subscriber(ctx, old_value, new_value)!;
+    foreach (observer_entry : entry.observers) {
+		observer_entry.observer.update()!;
     };
 
     entry.mu.unlock()!; 
 }
 
-fn AtomKey Atom.key(&self) {
-    void* ptr = self;
-    return ptr;
-}
-
-module atom(<Type>);
-
-import std::thread;
-
-fn void! Atom.subscribe(&self, Subscriber subscriber, void* ctx = null) {
-    AtomKey atom_key = self.key();
-
-    AtomEntry* entry;
-    if(!global_subscriptions.has_key(atom_key)) {   
-        entry = mem::new(AtomEntry);
-        if(catch err = entry.mu.init()){
-            mem::free(entry);
-            return err?;
-        }
-        entry.subscriptions.new_init();
-        global_subscriptions[atom_key] = entry;
-    } else {
-        entry = global_subscriptions.get(atom_key)!;
-    }
-  
-    if (entry.subscriptions.has_key(subscriber)) {
-        return AtomError.SUBSCRIBER_ALREADY_REGISTERED?;
-    }
+fn void! remove(Observable observable) {
+	SubscriptionKey subscription_key = observable.key();
     
-    entry.mu.lock()!;
-
-    entry.subscriptions[subscriber] = ctx;
-    
-    entry.mu.unlock()!;
-}
-
-fn void! Atom.unsubscribe(&self, Subscriber subscriber) {
-    AtomKey atom_key = self.key();
-
-    if (!global_subscriptions.has_key(atom_key)) {
-        return;
-    }
-
-    AtomEntry* entry = global_subscriptions.get(atom_key)!;
-
-    if(entry.subscriptions.is_empty()) {
-        return;
-    }
-
-    entry.mu.lock()!; 
-
-    entry.subscriptions.remove(subscriber);
-
-    entry.mu.unlock()!;
+    if (subscription_registry.has_key(subscription_key)) {
+        SubscriptionEntry* entry = subscription_registry[subscription_key]!;
+        entry.observers.clear();
+        mem::free(entry);
+        subscription_registry.remove(subscription_key);
+    }    
 }
